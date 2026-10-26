@@ -24,11 +24,14 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
+      # CAMBIO 1: se instala xvfb (pantalla virtual) junto a las dependencias
       - name: Instalar dependencias
         run: |
+          sudo apt-get install -y xvfb
           pip install -r requirements.txt
           playwright install --with-deps chromium
 
+      # CAMBIO 2: se ejecuta con "xvfb-run -a" para que haya navegador visible
       - name: Ejecutar lockout
         env:
           OBJETIVO: "elizabethotaval"
@@ -40,7 +43,7 @@ jobs:
           X_PASS:  ${{ secrets.X_PASS }}
           X_EMAIL: ${{ secrets.X_EMAIL }}
           X_TOTP:  ${{ secrets.X_TOTP }}
-        run: python lockout.py
+        run: xvfb-run -a python lockout.py
 
       - name: Subir capturas de error
         if: always()
