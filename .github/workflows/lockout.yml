@@ -25,16 +25,28 @@ jobs:
           cache: "pip"
 
       - name: Instalar dependencias
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          playwright install --with-deps chromium
 
       - name: Ejecutar lockout
         env:
           OBJETIVO: "elizabethotaval"
-          INTENTOS_POR_RAFAGA: "12"
-          MAX_JOB_MINUTOS: "350"
+          INTENTOS_POR_RAFAGA: "10"
+          PAUSA_ENTRE_INTENTOS: "3"
+          MAX_JOB_MINUTOS: "340"
           INTERVALO_MINUTOS: "50"
           X_USER:  ${{ secrets.X_USER }}
           X_PASS:  ${{ secrets.X_PASS }}
           X_EMAIL: ${{ secrets.X_EMAIL }}
           X_TOTP:  ${{ secrets.X_TOTP }}
         run: python lockout.py
+
+      - name: Subir capturas de error
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: capturas
+          path: debug/
+          if-no-files-found: ignore
+          retention-days: 7
