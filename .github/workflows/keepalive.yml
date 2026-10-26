@@ -1,0 +1,23 @@
+name: Keepalive
+
+on:
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  keepalive:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tocar el repo para mantener el cron vivo
+        run: |
+          git config user.name "lockout-bot"
+          git config user.email "bot@users.noreply.github.com"
+          date -u > .keepalive
+          git add .keepalive
+          git commit -m "keepalive $(date -u +%F)" || true
+          git push || true
