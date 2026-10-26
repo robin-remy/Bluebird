@@ -28,8 +28,8 @@ JITTER_SEGUNDOS   = 60  # desfase aleatorio para no ser robotico
 # Reportes (opcional): si hay credenciales, reporta al inicio de cada job.
 X_USER = os.environ.get("X_USER")
 X_PASS = os.environ.get("X_PASS")
-X_EMAIL = os.environ.get("X_EMAIL")
-X_TOTP = os.environ.get("X_TOTP")
+X_EMAIL = os.environ.get("X_EMAIL") or None
+X_TOTP  = os.environ.get("X_TOTP") or None
 HACER_REPORTE = bool(X_USER and X_PASS)
 # ----------------------------------------------------------------
 
