@@ -1,0 +1,40 @@
+name: X Lockout Continuo
+
+on:
+  schedule:
+    - cron: "0 */6 * * *"      # 4 ejecuciones al dia (UTC)
+  workflow_dispatch:            # boton para lanzarlo a mano
+
+concurrency:
+  group: x-lockout
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  lockout:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Instalar dependencias
+        run: pip install -r requirements.txt
+
+      - name: Ejecutar lockout
+        env:
+          OBJETIVO: "elizabethotaval"
+          INTENTOS_POR_RAFAGA: "12"
+          MAX_JOB_MINUTOS: "350"
+          INTERVALO_MINUTOS: "50"
+          X_USER:  ${{ secrets.X_USER }}
+          X_PASS:  ${{ secrets.X_PASS }}
+          X_EMAIL: ${{ secrets.X_EMAIL }}
+          X_TOTP:  ${{ secrets.X_TOTP }}
+        run: python lockout.py
