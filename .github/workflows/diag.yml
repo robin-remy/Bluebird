@@ -1,0 +1,25 @@
+name: Diagnostico
+on:
+  workflow_dispatch:
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: |
+          pip install playwright
+          playwright install --with-deps chromium
+      - name: Headless
+        run: python diag.py
+      - name: Con navegador visible (xvfb)
+        run: |
+          sudo apt-get install -y xvfb
+          xvfb-run -a env HEADLESS=0 python diag.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: diagnostico
+          path: debug/
